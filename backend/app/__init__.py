@@ -6,7 +6,8 @@ import os
 import time
 import uuid
 import warnings
-from threading import Lock
+from dataclasses import dataclass
+from threading import Lock, Thread
 
 # 抑制 multiprocessing resource_tracker 的警告（来自第三方库如 transformers）
 # 需要在所有其他导入之前设置
@@ -16,7 +17,14 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 from .config import Config
+from .services.graph_builder import GraphBuilderService
+from .services.ontology_generator import OntologyGenerator
+from .services.simulation_manager import SimulationManager, SimulationStatus
+from .services.simulation_runner import SimulationRunner, RunnerStatus
+from .utils.llm_client import LLMClient
 from .utils.logger import setup_logger, get_logger
+from .models.project import ProjectManager, ProjectStatus
+from .models.task import TaskManager, TaskStatus
 
 
 def create_app(config_class=Config):
@@ -81,82 +89,251 @@ def create_app(config_class=Config):
         return {'status': 'ok', 'service': 'MiroFish Backend'}
 
     # ---------------------------------------------------------------------
-    # Compatibility API for TradeFish integration.
+    # TradeFish bridge (REAL MiroFish mode)
     #
-    # TradeFish expects a minimal "swarm simulation" REST API:
-    #   POST /api/simulate -> {"simulation_id": "..."}
-    #   GET  /api/simulation/<id>/status -> {"status":"completed"}
-    #   GET  /api/simulation/<id>/report -> { ...report... }
+    # TradeFish expects:
+    #   POST /api/simulate
+    #   GET  /api/simulation/<id>/status
+    #   GET  /api/simulation/<id>/report
     #
-    # The full MiroFish backend uses richer endpoints under:
-    #   /api/simulation/*, /api/report/*, /api/graph/*
+    # We implement these by running the real MiroFish pipeline in a background
+    # thread:
+    #   seed text -> ontology -> Zep graph -> simulation prepare -> run -> LLM summary
     #
-    # For now we provide a lightweight, deterministic, in-memory implementation
-    # so TradeFish can run end-to-end without 404s while we evolve the deeper
-    # bridge to the full simulation pipeline.
+    # If ZEP/LLM configuration is missing or the pipeline fails, we fall back to
+    # a lightweight deterministic report (so TradeFish never hard-breaks).
     # ---------------------------------------------------------------------
-    _tf_lock = Lock()
-    _tf_sims: dict[str, dict] = {}
 
-    def _tf_sentiment_from_query(query: str) -> tuple[int, int, int]:
+    @dataclass
+    class _TFJob:
+        simulation_id: str
+        status: str  # created | preparing | running | completed | failed
+        created_at: float
+        updated_at: float
+        report: dict | None = None
+        error: str = ""
+        mode: str = "real"  # real | fallback
+
+    _tf_lock = Lock()
+    _tf_jobs: dict[str, _TFJob] = {}
+
+    def _tf_seed_text(data: dict) -> str:
+        q = str(data.get("prediction_query") or "").strip()
+        mats = data.get("seed_materials") or []
+        parts: list[str] = []
+        if q:
+            parts.append("PREDICTION_QUERY:\n" + q)
+        for m in mats:
+            if isinstance(m, dict):
+                t = str(m.get("type") or "context")
+                c = str(m.get("content") or "")
+                if c.strip():
+                    parts.append(f"[{t}]\n{c}".strip())
+        return "\n\n---\n\n".join(parts).strip()
+
+    def _tf_fallback_report(prediction_query: str) -> dict:
         # Deterministic pseudo-sentiment based on query hash.
-        h = sum(ord(c) for c in (query or "")) % 100
-        bullish = 30 + (h % 41)          # 30..70
-        bearish = 20 + ((h * 7) % 41)    # 20..60
+        h = sum(ord(c) for c in (prediction_query or "")) % 100
+        bullish = 30 + (h % 41)  # 30..70
+        bearish = 20 + ((h * 7) % 41)  # 20..60
         neutral = max(0, 100 - bullish - bearish)
-        # If we over-allocated, renormalize into 100 total.
         total = bullish + bearish + neutral
         if total != 100:
             scale = 100 / max(total, 1)
             bullish = int(round(bullish * scale))
             bearish = int(round(bearish * scale))
             neutral = max(0, 100 - bullish - bearish)
-        return bullish, bearish, neutral
-
-    @app.post('/api/simulate')
-    def tf_simulate():
-        data = request.get_json(silent=True) or {}
-        prediction_query = str(data.get("prediction_query") or "")
-        sim_id = f"tf_{uuid.uuid4().hex[:12]}"
-
-        bullish, bearish, neutral = _tf_sentiment_from_query(prediction_query)
-        narratives = []
-        if prediction_query:
-            narratives.append("Swarm aggregated the provided context into a short-term bias.")
-        cascades = []
-        if abs(bullish - bearish) < 8:
-            cascades.append("High disagreement: narrative flip risk elevated.")
-
-        report = {
+        return {
             "prediction": "bullish" if bullish > bearish else ("bearish" if bearish > bullish else "neutral"),
             "sentiment_distribution": {"bullish": bullish, "bearish": bearish, "neutral": neutral},
-            "key_narratives": narratives,
-            "cascade_triggers": cascades,
+            "key_narratives": ["Fallback mode: deterministic estimate (real pipeline unavailable)."],
+            "cascade_triggers": [],
             "contrarian_signals": [],
             "token_cost": 0.0,
             "generated_at": time.time(),
+            "mode": "fallback",
         }
 
+    def _tf_set(job: _TFJob) -> None:
         with _tf_lock:
-            _tf_sims[sim_id] = {"created_at": time.time(), "status": "completed", "report": report}
+            _tf_jobs[job.simulation_id] = job
 
-        return jsonify({"simulation_id": sim_id})
+    def _tf_get(simulation_id: str) -> _TFJob | None:
+        with _tf_lock:
+            return _tf_jobs.get(simulation_id)
 
-    @app.get('/api/simulation/<simulation_id>/status')
+    def _tf_worker(simulation_id: str, payload: dict) -> None:
+        job = _tf_get(simulation_id)
+        if not job:
+            return
+        try:
+            prediction_query = str(payload.get("prediction_query") or "").strip()
+            seed_text = _tf_seed_text(payload) or prediction_query
+
+            # Basic config checks.
+            if not Config.ZEP_API_KEY or not Config.LLM_API_KEY:
+                job.mode = "fallback"
+                job.status = "completed"
+                job.updated_at = time.time()
+                job.report = _tf_fallback_report(prediction_query)
+                _tf_set(job)
+                return
+
+            # 1) Create project + store extracted text
+            job.status = "preparing"
+            job.updated_at = time.time()
+            _tf_set(job)
+
+            proj = ProjectManager.create_project(name=f"TradeFish {simulation_id}")
+            proj.simulation_requirement = prediction_query or "TradeFish swarm simulation"
+            proj.total_text_length = len(seed_text)
+            ProjectManager.save_extracted_text(proj.project_id, seed_text)
+
+            # 2) Ontology (LLM)
+            onto = OntologyGenerator().generate(
+                document_texts=[seed_text],
+                simulation_requirement=proj.simulation_requirement,
+                additional_context="TradeFish bridge: derive a social-simulation ontology for market sentiment forecasting.",
+            )
+            proj.ontology = onto
+            proj.analysis_summary = onto.get("analysis_summary")
+            proj.status = ProjectStatus.ONTOLOGY_GENERATED
+            ProjectManager.save_project(proj)
+
+            # 3) Build Zep graph (async task + poll)
+            builder = GraphBuilderService(api_key=Config.ZEP_API_KEY)
+            task_id = builder.build_graph_async(
+                text=seed_text,
+                ontology=onto,
+                graph_name=f"TradeFish {simulation_id}",
+                chunk_size=int(payload.get("chunk_size") or 500),
+                chunk_overlap=int(payload.get("chunk_overlap") or 50),
+                batch_size=int(payload.get("batch_size") or 3),
+            )
+
+            tm = TaskManager()
+            graph_id: str | None = None
+            for _ in range(600):  # ~10 minutes worst-case at 1s intervals
+                t = tm.get_task(task_id)
+                if t and t.status == TaskStatus.COMPLETED:
+                    graph_id = (t.result or {}).get("graph_id")
+                    break
+                if t and t.status == TaskStatus.FAILED:
+                    raise RuntimeError("graph_build_failed")
+                time.sleep(1.0)
+
+            if not graph_id:
+                raise RuntimeError("graph_build_timeout")
+
+            proj.graph_id = graph_id
+            proj.status = ProjectStatus.GRAPH_COMPLETED
+            ProjectManager.save_project(proj)
+
+            # 4) Create + prepare simulation
+            sm = SimulationManager()
+            sim = sm.create_simulation(project_id=proj.project_id, graph_id=graph_id, enable_twitter=True, enable_reddit=True)
+            sm.prepare_simulation(
+                simulation_id=sim.simulation_id,
+                simulation_requirement=proj.simulation_requirement or "",
+                document_text=seed_text,
+                use_llm_for_profiles=True,
+                parallel_profile_count=int(payload.get("parallel_profile_count") or 3),
+            )
+
+            # 5) Run simulation (real multi-agent OASIS)
+            job.status = "running"
+            job.updated_at = time.time()
+            _tf_set(job)
+
+            max_rounds = int(payload.get("simulation_rounds") or payload.get("rounds") or 6)
+            SimulationRunner.start_simulation(sim.simulation_id, platform="parallel", max_rounds=max_rounds)
+
+            # Wait until runner completes.
+            for _ in range(3600):  # up to 1h
+                rs = SimulationRunner.get_run_state(sim.simulation_id)
+                if rs and rs.runner_status in (RunnerStatus.COMPLETED, RunnerStatus.FAILED, RunnerStatus.STOPPED):
+                    break
+                time.sleep(2.0)
+
+            rs = SimulationRunner.get_run_state(sim.simulation_id)
+            if not rs or rs.runner_status != RunnerStatus.COMPLETED:
+                raise RuntimeError("simulation_run_failed")
+
+            # 6) Summarize into TradeFish report schema (LLM JSON)
+            llm = LLMClient()
+            sys_prompt = (
+                "You are generating a compact trading-signal summary from a completed multi-agent social simulation. "
+                "Return ONLY valid JSON with keys: prediction, sentiment_distribution {bullish,bearish,neutral} as integers summing to 100, "
+                "key_narratives (list of strings), cascade_triggers (list), contrarian_signals (list), token_cost (number)."
+            )
+            user_payload = {
+                "prediction_query": prediction_query,
+                "simulation_id": sim.simulation_id,
+                "graph_id": graph_id,
+                "notes": "Use the simulation run state + action statistics to infer sentiment split and key narratives.",
+                "run_state": rs.to_detail_dict() if hasattr(rs, "to_detail_dict") else {},
+            }
+            rep = llm.chat_json(
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": str(user_payload)},
+                ],
+                temperature=0.2,
+                max_tokens=1200,
+            )
+
+            rep["generated_at"] = time.time()
+            rep["mode"] = "real"
+            rep.setdefault("sentiment_distribution", {"bullish": 34, "bearish": 33, "neutral": 33})
+
+            job.status = "completed"
+            job.updated_at = time.time()
+            job.report = rep
+            _tf_set(job)
+
+        except Exception as e:
+            # Fall back to keep TradeFish moving, but mark mode clearly.
+            prediction_query = str(payload.get("prediction_query") or "").strip()
+            job.mode = "fallback"
+            job.status = "completed"
+            job.updated_at = time.time()
+            job.error = f"{e.__class__.__name__}"
+            rep = _tf_fallback_report(prediction_query)
+            rep["error"] = job.error
+            job.report = rep
+            _tf_set(job)
+
+    @app.post("/api/simulate")
+    def tf_simulate():
+        payload = request.get_json(silent=True) or {}
+        simulation_id = f"sim_{uuid.uuid4().hex[:12]}"
+        job = _TFJob(
+            simulation_id=simulation_id,
+            status="created",
+            created_at=time.time(),
+            updated_at=time.time(),
+            report=None,
+            mode="real",
+        )
+        _tf_set(job)
+        Thread(target=_tf_worker, args=(simulation_id, payload), daemon=True).start()
+        return jsonify({"simulation_id": simulation_id})
+
+    @app.get("/api/simulation/<simulation_id>/status")
     def tf_sim_status(simulation_id: str):
-        with _tf_lock:
-            sim = _tf_sims.get(simulation_id)
-        if not sim:
+        job = _tf_get(simulation_id)
+        if not job:
             return jsonify({"status": "not_found"}), 404
-        return jsonify({"status": sim.get("status", "unknown")})
+        return jsonify({"status": job.status, "mode": job.mode, "error": job.error})
 
-    @app.get('/api/simulation/<simulation_id>/report')
+    @app.get("/api/simulation/<simulation_id>/report")
     def tf_sim_report(simulation_id: str):
-        with _tf_lock:
-            sim = _tf_sims.get(simulation_id)
-        if not sim:
+        job = _tf_get(simulation_id)
+        if not job:
             return jsonify({"error": "not_found"}), 404
-        return jsonify({"report": sim.get("report", {})})
+        if not job.report:
+            return jsonify({"error": "not_ready", "status": job.status}), 409
+        return jsonify({"report": job.report})
     
     if should_log_startup:
         logger.info("MiroFish Backend 启动完成")
