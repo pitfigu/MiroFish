@@ -319,6 +319,31 @@ class ZepEntityReader:
                 entity.related_nodes = related_nodes
             
             filtered_entities.append(entity)
+
+        # Fallback: if nothing matched the "custom label" rule, keep a few nodes anyway.
+        # TradeFish bridge runs should not hard-fail just because Zep produced only default labels.
+        if not filtered_entities:
+            fallback_nodes: list[dict[str, Any]] = []
+            for n in all_nodes:
+                if n.get("uuid") and n.get("name"):
+                    fallback_nodes.append(n)
+                if len(fallback_nodes) >= 3:
+                    break
+
+            for n in fallback_nodes:
+                labels = list(n.get("labels", []) or [])
+                if "Entity" not in labels:
+                    labels = ["Entity", *labels]
+                ent = EntityNode(
+                    uuid=str(n.get("uuid") or ""),
+                    name=str(n.get("name") or ""),
+                    labels=labels,
+                    summary=str(n.get("summary") or ""),
+                    attributes=dict(n.get("attributes") or {}),
+                )
+                filtered_entities.append(ent)
+            if filtered_entities:
+                entity_types_found.add("Entity")
         
         logger.info(f"筛选完成: 总节点 {total_count}, 符合条件 {len(filtered_entities)}, "
                    f"实体类型: {entity_types_found}")

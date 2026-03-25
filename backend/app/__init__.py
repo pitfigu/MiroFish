@@ -236,13 +236,15 @@ def create_app(config_class=Config):
             # 4) Create + prepare simulation
             sm = SimulationManager()
             sim = sm.create_simulation(project_id=proj.project_id, graph_id=graph_id, enable_twitter=True, enable_reddit=True)
-            sm.prepare_simulation(
+            prep_state = sm.prepare_simulation(
                 simulation_id=sim.simulation_id,
                 simulation_requirement=proj.simulation_requirement or "",
                 document_text=seed_text,
                 use_llm_for_profiles=True,
                 parallel_profile_count=int(payload.get("parallel_profile_count") or 3),
             )
+            if getattr(prep_state, "status", None) == SimulationStatus.FAILED:
+                raise RuntimeError(f"prepare_failed:{getattr(prep_state, 'error', '')}")
 
             # 5) Run simulation (real multi-agent OASIS)
             job.status = "running"
@@ -277,14 +279,26 @@ def create_app(config_class=Config):
                 "notes": "Use the simulation run state + action statistics to infer sentiment split and key narratives.",
                 "run_state": rs.to_detail_dict() if hasattr(rs, "to_detail_dict") else {},
             }
-            rep = llm.chat_json(
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": str(user_payload)},
-                ],
-                temperature=0.2,
-                max_tokens=1200,
-            )
+            try:
+                rep = llm.chat_json(
+                    messages=[
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": str(user_payload)},
+                    ],
+                    temperature=0.2,
+                    max_tokens=1200,
+                )
+            except Exception as e:
+                # Don't downgrade a completed REAL simulation just because JSON summarization failed.
+                rep = {
+                    "prediction": "neutral",
+                    "sentiment_distribution": {"bullish": 34, "bearish": 33, "neutral": 33},
+                    "key_narratives": [f"REAL simulation completed; summary failed: {e.__class__.__name__}"],
+                    "cascade_triggers": [],
+                    "contrarian_signals": [],
+                    "token_cost": 0.0,
+                    "summary_mode": "heuristic",
+                }
 
             rep["generated_at"] = time.time()
             rep["mode"] = "real"
@@ -298,6 +312,7 @@ def create_app(config_class=Config):
 
         except Exception as e:
             # Fall back to keep TradeFish moving, but mark mode clearly.
+            logger.exception("tradefish_real_worker_failed", simulation_id=simulation_id)
             prediction_query = str(payload.get("prediction_query") or "").strip()
             job.mode = "fallback"
             job.status = "completed"
