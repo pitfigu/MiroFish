@@ -5,6 +5,13 @@ MiroFish Backend 启动入口
 import os
 import sys
 
+# Reduce native thread fanout (Railway containers are thread-limited).
+# This affects numpy/scipy/OpenBLAS imports used by OASIS and friends.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 # 解决 Windows 控制台中文乱码问题：在所有导入之前设置 UTF-8 编码
 if sys.platform == 'win32':
     # 设置环境变量确保 Python 使用 UTF-8
