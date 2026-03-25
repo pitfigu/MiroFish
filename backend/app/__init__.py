@@ -373,20 +373,28 @@ def create_app(config_class=Config):
                 j = _tf_get(simulation_id)
                 with _real_lock:
                     _real_active_by_symbol.pop(symbol, None)
-                    if j and j.report and j.status == "completed" and (j.report.get("mode") == "real"):
-                        _real_latest_by_symbol[symbol] = j.report | {"symbol": symbol}
+                    # Store the latest completion even if it fell back, so callers
+                    # don't get stuck on 409 forever (mode will indicate real/fallback).
+                    if j and j.report and j.status == "completed":
+                        _real_latest_by_symbol[symbol] = j.report | {"symbol": symbol, "simulation_id": simulation_id}
 
         Thread(target=_run_and_store, daemon=True).start()
         return jsonify({"status": "queued", "symbol": symbol, "simulation_id": simulation_id})
 
     @app.get("/api/tradefish/latest")
     def tf_latest_real():
-        """Return latest completed REAL report for symbol (if any)."""
+        """Return latest completed report for symbol (real or fallback).
+
+        If a run is currently active, return 202 with the active simulation_id.
+        """
         symbol = str(request.args.get("symbol") or "").strip().upper()
         if not symbol:
             return jsonify({"error": "missing_symbol"}), 400
         with _real_lock:
+            active = _real_active_by_symbol.get(symbol)
             rep = _real_latest_by_symbol.get(symbol)
+        if active and not rep:
+            return jsonify({"status": "running", "simulation_id": active}), 202
         if not rep:
             return jsonify({"error": "not_ready"}), 409
         return jsonify({"report": rep})
