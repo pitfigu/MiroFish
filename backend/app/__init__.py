@@ -112,10 +112,14 @@ def create_app(config_class=Config):
         updated_at: float
         report: dict | None = None
         error: str = ""
-        mode: str = "real"  # real | fallback
+        mode: str = "fast"  # fast | real | fallback
 
     _tf_lock = Lock()
     _tf_jobs: dict[str, _TFJob] = {}
+
+    _real_lock = Lock()
+    _real_active_by_symbol: dict[str, str] = {}
+    _real_latest_by_symbol: dict[str, dict] = {}
 
     def _tf_seed_text(data: dict) -> str:
         q = str(data.get("prediction_query") or "").strip()
@@ -131,8 +135,8 @@ def create_app(config_class=Config):
                     parts.append(f"[{t}]\n{c}".strip())
         return "\n\n---\n\n".join(parts).strip()
 
-    def _tf_fallback_report(prediction_query: str) -> dict:
-        # Deterministic pseudo-sentiment based on query hash.
+    def _tf_fast_report(prediction_query: str) -> dict:
+        # Deterministic pseudo-sentiment based on query hash (fast + cheap).
         h = sum(ord(c) for c in (prediction_query or "")) % 100
         bullish = 30 + (h % 41)  # 30..70
         bearish = 20 + ((h * 7) % 41)  # 20..60
@@ -146,12 +150,12 @@ def create_app(config_class=Config):
         return {
             "prediction": "bullish" if bullish > bearish else ("bearish" if bearish > bullish else "neutral"),
             "sentiment_distribution": {"bullish": bullish, "bearish": bearish, "neutral": neutral},
-            "key_narratives": ["Fallback mode: deterministic estimate (real pipeline unavailable)."],
+            "key_narratives": ["Fast mode: deterministic estimate (no Zep/OASIS run)."],
             "cascade_triggers": [],
             "contrarian_signals": [],
             "token_cost": 0.0,
             "generated_at": time.time(),
-            "mode": "fallback",
+            "mode": "fast",
         }
 
     def _tf_set(job: _TFJob) -> None:
@@ -162,7 +166,7 @@ def create_app(config_class=Config):
         with _tf_lock:
             return _tf_jobs.get(simulation_id)
 
-    def _tf_worker(simulation_id: str, payload: dict) -> None:
+    def _tf_real_worker(simulation_id: str, payload: dict) -> None:
         job = _tf_get(simulation_id)
         if not job:
             return
@@ -175,7 +179,7 @@ def create_app(config_class=Config):
                 job.mode = "fallback"
                 job.status = "completed"
                 job.updated_at = time.time()
-                job.report = _tf_fallback_report(prediction_query)
+                job.report = _tf_fast_report(prediction_query) | {"mode": "fallback"}
                 _tf_set(job)
                 return
 
@@ -284,6 +288,7 @@ def create_app(config_class=Config):
 
             rep["generated_at"] = time.time()
             rep["mode"] = "real"
+            rep["simulation_id"] = simulation_id
             rep.setdefault("sentiment_distribution", {"bullish": 34, "bearish": 33, "neutral": 33})
 
             job.status = "completed"
@@ -298,7 +303,7 @@ def create_app(config_class=Config):
             job.status = "completed"
             job.updated_at = time.time()
             job.error = f"{e.__class__.__name__}"
-            rep = _tf_fallback_report(prediction_query)
+            rep = _tf_fast_report(prediction_query) | {"mode": "fallback"}
             rep["error"] = job.error
             job.report = rep
             _tf_set(job)
@@ -306,17 +311,17 @@ def create_app(config_class=Config):
     @app.post("/api/simulate")
     def tf_simulate():
         payload = request.get_json(silent=True) or {}
-        simulation_id = f"sim_{uuid.uuid4().hex[:12]}"
+        simulation_id = f"tf_{uuid.uuid4().hex[:12]}"
+        prediction_query = str(payload.get("prediction_query") or "").strip()
         job = _TFJob(
             simulation_id=simulation_id,
-            status="created",
+            status="completed",
             created_at=time.time(),
             updated_at=time.time(),
-            report=None,
-            mode="real",
+            report=_tf_fast_report(prediction_query) | {"simulation_id": simulation_id},
+            mode="fast",
         )
         _tf_set(job)
-        Thread(target=_tf_worker, args=(simulation_id, payload), daemon=True).start()
         return jsonify({"simulation_id": simulation_id})
 
     @app.get("/api/simulation/<simulation_id>/status")
@@ -334,6 +339,57 @@ def create_app(config_class=Config):
         if not job.report:
             return jsonify({"error": "not_ready", "status": job.status}), 409
         return jsonify({"report": job.report})
+
+    @app.post("/api/tradefish/queue")
+    def tf_queue_real():
+        """Queue a REAL MiroFish run for a symbol (non-blocking)."""
+        payload = request.get_json(silent=True) or {}
+        symbol = str(payload.get("symbol") or "").strip().upper()
+        if not symbol:
+            return jsonify({"error": "missing_symbol"}), 400
+
+        with _real_lock:
+            active = _real_active_by_symbol.get(symbol)
+            if active:
+                return jsonify({"status": "already_running", "symbol": symbol, "simulation_id": active})
+
+            simulation_id = f"real_{symbol.lower()}_{uuid.uuid4().hex[:8]}"
+            _real_active_by_symbol[symbol] = simulation_id
+
+        job = _TFJob(
+            simulation_id=simulation_id,
+            status="created",
+            created_at=time.time(),
+            updated_at=time.time(),
+            report=None,
+            mode="real",
+        )
+        _tf_set(job)
+
+        def _run_and_store() -> None:
+            try:
+                _tf_real_worker(simulation_id, payload)
+            finally:
+                j = _tf_get(simulation_id)
+                with _real_lock:
+                    _real_active_by_symbol.pop(symbol, None)
+                    if j and j.report and j.status == "completed" and (j.report.get("mode") == "real"):
+                        _real_latest_by_symbol[symbol] = j.report | {"symbol": symbol}
+
+        Thread(target=_run_and_store, daemon=True).start()
+        return jsonify({"status": "queued", "symbol": symbol, "simulation_id": simulation_id})
+
+    @app.get("/api/tradefish/latest")
+    def tf_latest_real():
+        """Return latest completed REAL report for symbol (if any)."""
+        symbol = str(request.args.get("symbol") or "").strip().upper()
+        if not symbol:
+            return jsonify({"error": "missing_symbol"}), 400
+        with _real_lock:
+            rep = _real_latest_by_symbol.get(symbol)
+        if not rep:
+            return jsonify({"error": "not_ready"}), 409
+        return jsonify({"report": rep})
     
     if should_log_startup:
         logger.info("MiroFish Backend 启动完成")
