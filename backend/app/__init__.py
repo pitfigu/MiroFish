@@ -220,7 +220,16 @@ def create_app(config_class=Config):
 
             base_graph_id = None
             if persist and symbol:
-                base_graph_id = f"tradefish_{symbol.lower()}"
+                scope = str(
+                    payload.get("persist_graph_scope")
+                    or os.environ.get("MIROFISH_PERSIST_GRAPH_SCOPE", "symbol")
+                    or "symbol"
+                ).strip().lower()
+                if scope in ("day", "daily", "symbol_day", "per_day"):
+                    day = time.strftime("%Y%m%d", time.gmtime())
+                    base_graph_id = f"tradefish_{symbol.lower()}_{day}"
+                else:
+                    base_graph_id = f"tradefish_{symbol.lower()}"
 
             chunk_size = int(payload.get("chunk_size") or 500)
             chunk_overlap = int(payload.get("chunk_overlap") or 50)
