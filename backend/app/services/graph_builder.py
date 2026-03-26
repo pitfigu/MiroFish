@@ -184,17 +184,35 @@ class GraphBuilderService:
             error_msg = f"{str(e)}\n{traceback.format_exc()}"
             self.task_manager.fail_task(task_id, error_msg)
     
+    def get_or_create_graph(self, *, name: str, graph_id: Optional[str] = None) -> tuple[str, bool]:
+        """Get or create a Zep standalone graph.
+
+        If `graph_id` is provided, we try to create it deterministically. If it already
+        exists, we reuse it (persistent graphs across runs/restarts).
+        """
+        gid = (graph_id or "").strip() or f"mirofish_{uuid.uuid4().hex[:16]}"
+        created = False
+        try:
+            self.client.graph.create(
+                graph_id=gid,
+                name=name,
+                description="MiroFish Social Simulation Graph",
+            )
+            created = True
+            return gid, created
+        except Exception:
+            # If create failed because it already exists, verify via a lightweight node list call.
+            try:
+                self.client.graph.node.get_by_graph_id(gid, limit=1, cursor=None)
+                return gid, False
+            except Exception:
+                # Bubble up the original failure semantics to the caller.
+                raise
+
     def create_graph(self, name: str) -> str:
         """创建Zep图谱（公开方法）"""
-        graph_id = f"mirofish_{uuid.uuid4().hex[:16]}"
-        
-        self.client.graph.create(
-            graph_id=graph_id,
-            name=name,
-            description="MiroFish Social Simulation Graph"
-        )
-        
-        return graph_id
+        gid, _ = self.get_or_create_graph(name=name)
+        return gid
     
     def set_ontology(self, graph_id: str, ontology: Dict[str, Any]):
         """设置图谱本体（公开方法）"""

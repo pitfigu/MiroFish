@@ -3,6 +3,7 @@ MiroFish Backend - Flask应用工厂
 """
 
 import os
+import contextlib
 import time
 import uuid
 import warnings
@@ -204,30 +205,44 @@ def create_app(config_class=Config):
             proj.status = ProjectStatus.ONTOLOGY_GENERATED
             ProjectManager.save_project(proj)
 
-            # 3) Build Zep graph (async task + poll)
+            # 3) Build or reuse a persistent Zep graph.
+            #
+            # TradeFish goal: graphs should accumulate edges over time (per symbol),
+            # so "today's graph" isn't a fresh single-node graph every run.
             builder = GraphBuilderService(api_key=Config.ZEP_API_KEY)
-            task_id = builder.build_graph_async(
-                text=seed_text,
-                ontology=onto,
-                graph_name=f"TradeFish {simulation_id}",
-                chunk_size=int(payload.get("chunk_size") or 500),
-                chunk_overlap=int(payload.get("chunk_overlap") or 50),
-                batch_size=int(payload.get("batch_size") or 3),
+
+            symbol = str(payload.get("symbol") or "").strip().upper()
+            persist = str(
+                payload.get("persist_graph")
+                or os.environ.get("MIROFISH_PERSIST_GRAPH", "1")
+                or "1"
+            ).strip().lower() in ("1", "true", "yes", "on")
+
+            base_graph_id = None
+            if persist and symbol:
+                base_graph_id = f"tradefish_{symbol.lower()}"
+
+            chunk_size = int(payload.get("chunk_size") or 500)
+            chunk_overlap = int(payload.get("chunk_overlap") or 50)
+            batch_size = int(payload.get("batch_size") or 3)
+
+            graph_id, created = builder.get_or_create_graph(
+                name=f"TradeFish {symbol or simulation_id}",
+                graph_id=base_graph_id,
             )
 
-            tm = TaskManager()
-            graph_id: str | None = None
-            for _ in range(600):  # ~10 minutes worst-case at 1s intervals
-                t = tm.get_task(task_id)
-                if t and t.status == TaskStatus.COMPLETED:
-                    graph_id = (t.result or {}).get("graph_id")
-                    break
-                if t and t.status == TaskStatus.FAILED:
-                    raise RuntimeError("graph_build_failed")
-                time.sleep(1.0)
+            # Only set ontology on first create; re-setting ontology on a reused graph can
+            # invalidate prior structure.
+            if created:
+                builder.set_ontology(graph_id, onto)
 
-            if not graph_id:
-                raise RuntimeError("graph_build_timeout")
+            # Always append new text as episodes so the graph evolves.
+            from .services.text_processor import TextProcessor  # local import to avoid circulars
+
+            chunks = TextProcessor.split_text(seed_text, chunk_size, chunk_overlap)
+            episode_uuids = builder.add_text_batches(graph_id, chunks, batch_size, None)
+            with contextlib.suppress(Exception):
+                builder._wait_for_episodes(episode_uuids, None)
 
             proj.graph_id = graph_id
             proj.status = ProjectStatus.GRAPH_COMPLETED
